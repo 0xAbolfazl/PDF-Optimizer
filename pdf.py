@@ -5,14 +5,15 @@ from tkinter import filedialog, messagebox
 from datetime import datetime
 import threading
 import time
+import math
 
 class PDFResizerApp:
     def __init__(self):
         # Initialize the main window
         self.window = ctk.CTk()
         self.window.title("PDF Resizer Pro")
-        self.window.geometry("600x700")
-        self.window.minsize(500, 600)
+        self.window.geometry("600x800")
+        self.window.minsize(500, 650)
         
         # Set dark theme
         ctk.set_appearance_mode("dark")
@@ -158,6 +159,21 @@ class PDFResizerApp:
         self.dpi_combo.set("300")
         self.dpi_combo.pack(fill="x", pady=8)
         
+        # Split PDF setting
+        split_frame = ctk.CTkFrame(settings_card, fg_color="transparent")
+        split_frame.pack(pady=8, padx=20, fill="x")
+        
+        ctk.CTkLabel(split_frame, text="✂️ Max Pages per File (0 = no split):", font=ctk.CTkFont(weight="bold")).pack(anchor="w")
+        
+        self.split_var = ctk.StringVar(value="10")
+        self.split_entry = ctk.CTkEntry(
+            split_frame,
+            textvariable=self.split_var,
+            placeholder_text="Enter max pages per file",
+            justify="center"
+        )
+        self.split_entry.pack(fill="x", pady=8)
+        
         # Start button section
         button_frame = ctk.CTkFrame(self.main_container, fg_color="transparent")
         button_frame.pack(pady=20, fill="x")
@@ -173,7 +189,7 @@ class PDFResizerApp:
             hover_color="#E55A2B",
             border_width=0
         )
-        self.start_btn.pack(pady=10, padx=80)
+        self.start_btn.pack(pady=10, padx=80, fill="x")
         
         # Status label
         self.status_label = ctk.CTkLabel(
@@ -306,6 +322,16 @@ class PDFResizerApp:
         if self.is_processing:
             return
         
+        # Validate split value
+        try:
+            max_pages = int(self.split_var.get())
+            if max_pages < 0:
+                messagebox.showerror("Error", "Max pages per file must be a positive number or 0!")
+                return
+        except ValueError:
+            messagebox.showerror("Error", "Please enter a valid number for max pages per file!")
+            return
+        
         # Switch to processing UI
         self.show_processing_ui()
         self.is_processing = True
@@ -317,7 +343,7 @@ class PDFResizerApp:
         # Start processing in separate thread
         self.processing_thread = threading.Thread(
             target=self.process_pdf_thread,
-            args=(self.input_file, self.output_file, scale_factor, dpi),
+            args=(self.input_file, self.output_file, scale_factor, dpi, max_pages),
             daemon=True
         )
         self.processing_thread.start()
@@ -351,63 +377,120 @@ class PDFResizerApp:
         else:
             self.processing_status.configure(text="✨ Finalizing...", text_color="#4CAF50")
     
-    def process_pdf_thread(self, input_path, output_path, scale_factor, dpi):
+    def process_pdf_thread(self, input_path, output_path, scale_factor, dpi, max_pages_per_file):
         """Process PDF in separate thread"""
         try:
-            success = self.resize_pdf_for_printing(input_path, output_path, scale_factor, dpi)
-            self.window.after(0, lambda: self.on_processing_complete(success, input_path, output_path))
+            success, output_files = self.resize_pdf_for_printing(input_path, output_path, scale_factor, dpi, max_pages_per_file)
+            self.window.after(0, lambda: self.on_processing_complete(success, input_path, output_files))
             
         except Exception as e:
             self.window.after(0, lambda: self.on_processing_error(str(e)))
     
-    def resize_pdf_for_printing(self, input_pdf_path, output_pdf_path, scale_factor, dpi):
+    def resize_pdf_for_printing(self, input_pdf_path, output_pdf_path, scale_factor, dpi, max_pages_per_file):
         """Resize PDF pages with high resolution for quality printing."""
         try:
             input_doc = fitz.open(input_pdf_path)
-            output_doc = fitz.open()
-            
-            zoom = dpi / 72
             total_pages = len(input_doc)
+            zoom = dpi / 72  # Define zoom here to be available in both branches
             
-            for page_num in range(total_pages):
-                if not self.is_processing:
-                    return False
+            # Determine if we need to split the output
+            split_files = max_pages_per_file > 0 and total_pages > max_pages_per_file
+            
+            if split_files:
+                # Calculate number of output files needed
+                num_files = math.ceil(total_pages / max_pages_per_file)
+                output_files = []
+                
+                for file_index in range(num_files):
+                    # Create a new output document for this chunk
+                    output_doc = fitz.open()
                     
-                page = input_doc.load_page(page_num)
-                original_rect = page.rect
+                    # Calculate page range for this file
+                    start_page = file_index * max_pages_per_file
+                    end_page = min((file_index + 1) * max_pages_per_file, total_pages)
+                    
+                    # Process each page in this range
+                    for page_num in range(start_page, end_page):
+                        if not self.is_processing:
+                            return False, []
+                            
+                        page = input_doc.load_page(page_num)
+                        original_rect = page.rect
+                        
+                        new_page = output_doc.new_page(width=original_rect.width, height=original_rect.height)
+                        
+                        scaled_width = original_rect.width * scale_factor
+                        scaled_height = original_rect.height * scale_factor
+                        
+                        x_offset = (original_rect.width - scaled_width) / 2
+                        y_offset = (original_rect.height - scaled_height) / 2
+                        
+                        matrix = fitz.Matrix(zoom * scale_factor, zoom * scale_factor)
+                        pix = page.get_pixmap(matrix=matrix)
+                        
+                        target_rect = fitz.Rect(x_offset, y_offset, x_offset + scaled_width, y_offset + scaled_height)
+                        new_page.insert_image(target_rect, pixmap=pix)
+                        
+                        progress_percentage = ((page_num + 1) / total_pages) * 100
+                        self.update_progress(page_num + 1, total_pages, progress_percentage)
+                        
+                        time.sleep(0.02)
+                    
+                    if self.is_processing:
+                        # Generate filename for this chunk
+                        base_name, ext = os.path.splitext(output_pdf_path)
+                        chunk_filename = f"{base_name}_part{file_index + 1}{ext}"
+                        output_doc.save(chunk_filename, deflate=True)
+                        output_files.append(chunk_filename)
+                        output_doc.close()
+                    else:
+                        return False, []
                 
-                new_page = output_doc.new_page(width=original_rect.width, height=original_rect.height)
-                
-                scaled_width = original_rect.width * scale_factor
-                scaled_height = original_rect.height * scale_factor
-                
-                x_offset = (original_rect.width - scaled_width) / 2
-                y_offset = (original_rect.height - scaled_height) / 2
-                
-                matrix = fitz.Matrix(zoom * scale_factor, zoom * scale_factor)
-                pix = page.get_pixmap(matrix=matrix)
-                
-                target_rect = fitz.Rect(x_offset, y_offset, x_offset + scaled_width, y_offset + scaled_height)
-                new_page.insert_image(target_rect, pixmap=pix)
-                
-                progress_percentage = ((page_num + 1) / total_pages) * 100
-                self.update_progress(page_num + 1, total_pages, progress_percentage)
-                
-                time.sleep(0.02)
-            
-            if self.is_processing:
-                output_doc.save(output_pdf_path, deflate=True)
-                output_doc.close()
                 input_doc.close()
-                return True
+                return True, output_files
             else:
-                return False
+                # Process as single file (original behavior)
+                output_doc = fitz.open()
                 
+                for page_num in range(total_pages):
+                    if not self.is_processing:
+                        return False, []
+                        
+                    page = input_doc.load_page(page_num)
+                    original_rect = page.rect
+                    
+                    new_page = output_doc.new_page(width=original_rect.width, height=original_rect.height)
+                    
+                    scaled_width = original_rect.width * scale_factor
+                    scaled_height = original_rect.height * scale_factor
+                    
+                    x_offset = (original_rect.width - scaled_width) / 2
+                    y_offset = (original_rect.height - scaled_height) / 2
+                    
+                    matrix = fitz.Matrix(zoom * scale_factor, zoom * scale_factor)
+                    pix = page.get_pixmap(matrix=matrix)
+                    
+                    target_rect = fitz.Rect(x_offset, y_offset, x_offset + scaled_width, y_offset + scaled_height)
+                    new_page.insert_image(target_rect, pixmap=pix)
+                    
+                    progress_percentage = ((page_num + 1) / total_pages) * 100
+                    self.update_progress(page_num + 1, total_pages, progress_percentage)
+                    
+                    time.sleep(0.02)
+                
+                if self.is_processing:
+                    output_doc.save(output_pdf_path, deflate=True)
+                    output_doc.close()
+                    input_doc.close()
+                    return True, [output_pdf_path]
+                else:
+                    return False, []
+                    
         except Exception as e:
             print(f"Error in processing: {e}")
-            return False
+            return False, []
     
-    def on_processing_complete(self, success, input_path, output_path):
+    def on_processing_complete(self, success, input_path, output_files):
         """Handle processing completion"""
         self.is_processing = False
         self.show_main_ui()
@@ -416,14 +499,23 @@ class PDFResizerApp:
             self.status_label.configure(text="✅ Processing completed successfully!", text_color="#4CAF50")
             
             input_size = os.path.getsize(input_path) / 1024 / 1024
-            output_size = os.path.getsize(output_path) / 1024 / 1024
+            
+            if len(output_files) > 1:
+                # Multiple files were created
+                output_info = f"📦 Created {len(output_files)} files:\n"
+                for i, file_path in enumerate(output_files):
+                    file_size = os.path.getsize(file_path) / 1024 / 1024
+                    output_info += f"   Part {i+1}: {os.path.basename(file_path)} ({file_size:.1f} MB)\n"
+            else:
+                # Single file was created
+                output_size = os.path.getsize(output_files[0]) / 1024 / 1024
+                output_info = f"📤 Output: {output_size:.1f} MB\n💾 Saved as: {os.path.basename(output_files[0])}"
             
             messagebox.showinfo(
                 "Success", 
                 f"PDF processed successfully!\n\n"
                 f"📦 Input: {input_size:.1f} MB\n"
-                f"📤 Output: {output_size:.1f} MB\n"
-                f"💾 Saved as: {os.path.basename(output_path)}"
+                f"{output_info}"
             )
         else:
             self.status_label.configure(text="ℹ️ Processing completed", text_color="#FF6B35")
